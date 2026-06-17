@@ -1774,58 +1774,107 @@ document.getElementById('pdf-input').addEventListener('change', async (e) => {
 });
 
 async function extractDishImage(pdf) {
-  // Render page 1 to a canvas and use it as the dish image.
-  // This reliably captures whatever photo is on the recipe sheet.
+  // Pull the embedded photo out of page 1. The recipe sheets have one large
+  // raster image (the dish), so we find it, convert its pixels to a canvas,
+  // and return that. Falls back to a page render only if no usable image.
   const page = await pdf.getPage(1);
+
+  // Render the page first — this forces pdf.js to load/resolve the image objects
+  // so we can read them afterward.
   const viewport = page.getViewport({ scale: 1.5 });
   const canvas = document.createElement('canvas');
   canvas.width = viewport.width;
   canvas.height = viewport.height;
-  const ctx = canvas.getContext('2d');
-  await page.render({ canvasContext: ctx, viewport }).promise;
+  await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
 
-  // Try to find the embedded raster image and crop to it; fall back to full page render
+  // Collect every image drawn on the page.
   const ops = await page.getOperatorList();
-  let imgName = null;
+  const imgNames = [];
   for (let i = 0; i < ops.fnArray.length; i++) {
     if (ops.fnArray[i] === pdfjsLib.OPS.paintImageXObject) {
-      imgName = ops.argsArray[i][0];
-      break;
+      imgNames.push(ops.argsArray[i][0]);
     }
   }
-  if (imgName && page.objs.has(imgName)) {
+
+  // Resolve an image object by name using the async callback form.
+  // The synchronous get() throws if the object isn't ready yet — that was the bug.
+  function resolveImg(name) {
+    return new Promise((resolve) => {
+      try {
+        page.objs.get(name, (img) => resolve(img));
+      } catch (e) { resolve(null); }
+    });
+  }
+
+  // Find the largest image (the dish photo, not a tiny logo/icon).
+  let best = null;
+  for (const name of imgNames) {
+    const img = await resolveImg(name);
+    if (img && img.width > 200 && img.height > 200) {
+      if (!best || img.width * img.height > best.width * best.height) best = img;
+    }
+  }
+
+  if (best) {
     try {
-      const img = page.objs.get(imgName);
-      if (img && img.width > 120 && img.height > 120) {
-        const c2 = document.createElement('canvas');
-        c2.width = img.width; c2.height = img.height;
-        const cx = c2.getContext('2d');
-        const imgData = cx.createImageData(img.width, img.height);
-        const src = img.data;
-        // Handle RGB vs RGBA
-        if (src.length === img.width * img.height * 3) {
-          for (let j = 0, k = 0; j < src.length; j += 3, k += 4) {
-            imgData.data[k] = src[j]; imgData.data[k+1] = src[j+1];
-            imgData.data[k+2] = src[j+2]; imgData.data[k+3] = 255;
-          }
-        } else {
-          imgData.data.set(src);
-        }
-        cx.putImageData(imgData, 0, 0);
-        return c2.toDataURL('image/jpeg', 0.82);
+      const out = imageObjToCanvas(best);
+      if (out) {
+        // Cap width so the stored data URL stays a reasonable size.
+        return downscaleCanvas(out, 1000).toDataURL('image/jpeg', 0.85);
       }
-    } catch (e) { /* fall through to page render */ }
+    } catch (e) { /* fall through */ }
   }
-  // Fallback: downscale full page render
-  const maxW = 800;
-  if (canvas.width > maxW) {
-    const c3 = document.createElement('canvas');
-    const ratio = maxW / canvas.width;
-    c3.width = maxW; c3.height = canvas.height * ratio;
-    c3.getContext('2d').drawImage(canvas, 0, 0, c3.width, c3.height);
-    return c3.toDataURL('image/jpeg', 0.82);
+
+  // Fallback: a downscaled render of the whole page.
+  return downscaleCanvas(canvas, 800).toDataURL('image/jpeg', 0.82);
+}
+
+// Convert a pdf.js image object (raw pixel data) into a canvas.
+function imageObjToCanvas(img) {
+  const { width, height, kind } = img;
+  const src = img.data;
+  if (!src) {
+    // Some builds expose an ImageBitmap instead of raw data.
+    if (img.bitmap) {
+      const c = document.createElement('canvas');
+      c.width = width; c.height = height;
+      c.getContext('2d').drawImage(img.bitmap, 0, 0);
+      return c;
+    }
+    return null;
   }
-  return canvas.toDataURL('image/jpeg', 0.82);
+  const c = document.createElement('canvas');
+  c.width = width; c.height = height;
+  const cx = c.getContext('2d');
+  const out = cx.createImageData(width, height);
+  const dst = out.data;
+  // kind: 1 = grayscale, 2 = RGB, 3 = RGBA (pdf.js ImageKind enum)
+  if (kind === 3 || src.length === width * height * 4) {
+    dst.set(src);
+  } else if (kind === 2 || src.length === width * height * 3) {
+    for (let j = 0, k = 0; j < src.length; j += 3, k += 4) {
+      dst[k] = src[j]; dst[k+1] = src[j+1]; dst[k+2] = src[j+2]; dst[k+3] = 255;
+    }
+  } else if (kind === 1 || src.length === width * height) {
+    for (let j = 0, k = 0; j < src.length; j += 1, k += 4) {
+      dst[k] = dst[k+1] = dst[k+2] = src[j]; dst[k+3] = 255;
+    }
+  } else {
+    return null; // unknown format
+  }
+  cx.putImageData(out, 0, 0);
+  return c;
+}
+
+// Downscale a canvas so its width is at most maxW, preserving aspect ratio.
+function downscaleCanvas(src, maxW) {
+  if (src.width <= maxW) return src;
+  const ratio = maxW / src.width;
+  const c = document.createElement('canvas');
+  c.width = maxW;
+  c.height = Math.round(src.height * ratio);
+  c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+  return c;
 }
 
 function parseRecipeText(text, filename) {
